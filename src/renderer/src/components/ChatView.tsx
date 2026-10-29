@@ -25,6 +25,7 @@ import { SubagentTraceView, ToolIcon } from "./ToolCard";
 import { TerminalRunCard, TerminalTail, type TerminalRun } from "./TerminalRunCard";
 import { type IconKind } from "../toolLabel";
 import { insertAtComposer } from "../composerText";
+import { appliedInsert, noteInsertApplied, readDraft, saveDraft } from "../composerDrafts";
 import { mcpChipLabel, mcpChipTitle, serversForWorkspace } from "../mcpChip";
 import { folderHasCode } from "../onboarding";
 import { MicButton } from "./MicButton";
@@ -314,7 +315,9 @@ export function ChatView({
   /** §23 round 9: the session's active plan — the pill's data, null when none. */
   activePlan?: PlanCardData | null;
 }): React.JSX.Element {
-  const [input, setInput] = useState("");
+  // The unsent message comes back with the session (composerDrafts.ts): a workspace
+  // switch unmounts this composer, and the text used to go with it.
+  const [input, setInput] = useState(() => readDraft(sessionId).text);
   // Composer row aligns centered on one line; when the textarea wraps to multiple
   // lines the controls pin to the top instead (all on the same horizontal line).
   const [multiline, setMultiline] = useState(false);
@@ -393,11 +396,15 @@ export function ChatView({
 
   // §27: the append rule now lives in composerText.ts, shared with dictation so
   // the two paths cannot land text in different places.
-  const lastInsert = useRef(0);
+  // Seeded from the session's record, not 0: App never clears its one insert, so a
+  // composer mounting again (a workspace switch) would apply it a second time on
+  // top of the restored draft. One that arrived while it was away still lands.
+  const lastInsert = useRef(appliedInsert(sessionId));
   useEffect(() => {
     const n = composerInsert?.nonce ?? 0;
     if (!n || n === lastInsert.current) return;
     lastInsert.current = n;
+    noteInsertApplied(sessionId, n);
     insertText(composerInsert!.text);
     // §17 round 28: a fork's documents, re-attached by path exactly as Rewind does.
     if (composerInsert!.docs?.length) void attachDocumentPaths(composerInsert!.docs);
@@ -623,9 +630,9 @@ export function ChatView({
    * authentication, and adding or removing a server all push through it.
    */
   const [mcpServers, setMcpServers] = useState<McpServerStatusLike[] | null>(null);
-  const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ImageAttachment[]>(() => readDraft(sessionId).images);
   // §31: documents are converted AT PICK TIME, so a chip already knows its cost.
-  const [documents, setDocuments] = useState<DocumentAttachment[]>([]);
+  const [documents, setDocuments] = useState<DocumentAttachment[]>(() => readDraft(sessionId).documents);
   /**
    * §31: a document that would not convert is a MESSAGE, not a chip.
    *
@@ -661,15 +668,33 @@ export function ChatView({
     refetch();
     return window.hv.onProvidersChanged(refetch);
   }, [workspace]);
-  // Session switch: attachments and the restart hint belong to the old session.
+  /**
+   * Mount (App keys each ChatView by its session, so `sessionId` never changes
+   * under one): the text, pictures and documents of the session's draft came in
+   * through the lazy initialisers above and are NOT set again here — a
+   * `composerInsert` that landed on this same mount (a send handed back while the
+   * composer was away) must survive. What is restored here is what those cannot
+   * carry: the @mention map, after the workspace effect above emptied it, and a
+   * document that was still converting when the composer went away (its answer
+   * reached an unmounted component).
+   */
   useEffect(() => {
-    setAttachments([]);
-    setDocuments([]);
+    const d = readDraft(sessionId);
+    mentionMap.current = new Map(d.mentions);
+    const converting = d.documents.filter((x) => x.pending).map((x) => x.path);
+    if (converting.length) void attachDocumentPaths(converting);
     setDocumentErrors([]);
     setRestartHint(false);
     setModelMenuOpen(false);
     setAttachMenuOpen(false);
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- once per mount; attachDocumentPaths is recreated every render
   }, [sessionId]);
+  // Every edit is kept, so whatever unmounts this composer next finds it saved.
+  // The mention map has no effect of its own: picking a mention always edits the
+  // text too, which is what saves it.
+  useEffect(() => {
+    saveDraft(sessionId, { text: input, images: attachments, documents, mentions: [...mentionMap.current] });
+  }, [sessionId, input, attachments, documents]);
   // §16 (2026-07-30): a tier pinned to a provider that no longer exists (deleted
   // custom endpoint) must not win resolution — drop it so the chip shows the
   // tier actually in effect. The list comes from MAIN (hv:get-providers) because
@@ -1259,7 +1284,7 @@ export function ChatView({
       )}
       {/* Round 3 #11 / §9: rewind confirm — the chosen scope decides what rolls back (rewindActions). */}
       {pendingRewind !== null && (
-        <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-ink/60 p-8" onClick={() => setPendingRewind(null)}>
+        <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-scrim/60 p-8" onClick={() => setPendingRewind(null)}>
           <div className="hv-dialog-flow w-full max-w-md rounded-2xl border-2 border-line-strong bg-card p-5 shadow-sticker-lg" onClick={(e) => e.stopPropagation()}>
             <div className="font-bold text-ink mb-1">{forkMode ? FORK_DIALOG.title : "Rewind to this message?"}</div>
             {forkMode ? (
@@ -1416,7 +1441,7 @@ export function ChatView({
       )}
       {/* Round 3 #3: large-paste confirm. */}
       {pendingPaste !== null && (
-        <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-ink/60 p-8" onClick={() => setPendingPaste(null)}>
+        <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-scrim/60 p-8" onClick={() => setPendingPaste(null)}>
           <div className="hv-dialog-flow w-full max-w-md rounded-2xl border-2 border-line-strong bg-card p-5 shadow-sticker-lg" onClick={(e) => e.stopPropagation()}>
             <div className="font-bold text-ink mb-1">Paste {pendingPaste.length.toLocaleString()} characters?</div>
             <p className="text-sm text-ink-soft mb-4">That's a large amount of text to add to the composer. Insert it anyway?</p>
@@ -1517,7 +1542,7 @@ export function ChatView({
               // is load-bearing — the rail's expanded overlay is `absolute` and
               // positions against the nearest positioned ancestor, which is this
               // container or nothing.
-              <div className="sticky top-0 z-20 px-6 relative max-w-3xl mx-auto w-full">
+              <div className="sticky top-0 z-20 px-6 relative max-w-chat mx-auto w-full">
                 <RunRail
                   runs={delegations}
                   terminalRuns={terminalRuns}
@@ -1616,7 +1641,7 @@ export function ChatView({
             auto-send and §29 left the first commit to the user. The row is
             gone for good after the first send. */}
         {chips && chips.length > 0 && (
-          <div className="max-w-3xl mx-auto flex flex-wrap items-center justify-center gap-2 px-1 pb-2">
+          <div className="max-w-chat mx-auto flex flex-wrap items-center justify-center gap-2 px-1 pb-2">
             {chips.map((c) => (
               <button
                 key={c}
@@ -1631,7 +1656,7 @@ export function ChatView({
         )}
         {/* Queued messages (Pi queue_update). Abort preserves the queue — chips stay after Stop. */}
         {queued > 0 && (
-          <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-1.5 px-1 pb-2">
+          <div className="max-w-chat mx-auto flex flex-wrap items-center gap-1.5 px-1 pb-2">
             <span
               className="text-[10px] font-bold uppercase tracking-widest text-ink-soft"
               title="Queued messages are kept even if you press Stop."
@@ -1668,7 +1693,7 @@ export function ChatView({
         )}
         {/* W2.1: attached-image chips — thumbnail + remove, sent with the next prompt. */}
         {attachments.length > 0 && (
-          <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-2 px-1 pb-2">
+          <div className="max-w-chat mx-auto flex flex-wrap items-center gap-2 px-1 pb-2">
             {attachments.map((a, i) => (
               <span
                 key={i}
@@ -1693,7 +1718,7 @@ export function ChatView({
             the label carries the CONTEXT COST, because this is the surface where
             the user decides whether to spend it (§9, one step earlier). */}
         {documents.length > 0 && (
-          <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-2 px-1 pb-2">
+          <div className="max-w-chat mx-auto flex flex-wrap items-center gap-2 px-1 pb-2">
             {documents.map((d, i) => (
               <span
                 key={`${d.path}-${i}`}
@@ -1727,7 +1752,7 @@ export function ChatView({
         {/* §28: picked-element chips. Same shelf as the image attachments and the
             same promise — nothing is sent until the user sends it. */}
         {(pageRefs?.length ?? 0) > 0 && (
-          <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-2 px-1 pb-2">
+          <div className="max-w-chat mx-auto flex flex-wrap items-center gap-2 px-1 pb-2">
             {pageRefs!.map((ref, i) => (
               <span
                 key={i}
@@ -1754,7 +1779,7 @@ export function ChatView({
         )}
         {/* W2.1: honest fallback — live switch failed, override applies at next spawn. */}
         {restartHint && (
-          <div className="max-w-3xl mx-auto px-1 pb-1.5 text-[11px] font-semibold text-ink-soft">
+          <div className="max-w-chat mx-auto px-1 pb-1.5 text-[11px] font-semibold text-ink-soft">
             Model saved — applies when this session restarts.
           </div>
         )}
@@ -1762,7 +1787,7 @@ export function ChatView({
             user's own terms — the chip could only truncate it. Dismissible,
             because it is advice about a file that is no longer attached. */}
         {documentErrors.map((msg, i) => (
-          <div key={i} className="max-w-3xl mx-auto px-1 pb-1.5 flex items-start gap-1.5 text-[11px] font-semibold text-berry">
+          <div key={i} className="max-w-chat mx-auto px-1 pb-1.5 flex items-start gap-1.5 text-[11px] font-semibold text-berry">
             <span className="flex-1">{msg}</span>
             <button
               type="button"
@@ -1775,11 +1800,11 @@ export function ChatView({
           </div>
         ))}
         {noModel && (
-          <div className="max-w-3xl mx-auto px-1 pb-1.5 text-[11px] font-semibold text-berry">
+          <div className="max-w-chat mx-auto px-1 pb-1.5 text-[11px] font-semibold text-berry">
             No model configured — set one up on the <GoTo view="models" /> page to start chatting.
           </div>
         )}
-        <div className={`max-w-3xl mx-auto flex gap-1.5 ${multiline ? "items-start" : "items-center"} rounded-2xl bg-card border-2 border-line-strong shadow-sticker-lg px-2 py-1.5 focus-within:border-tangerine transition-colors`}>
+        <div className={`max-w-chat mx-auto flex gap-1.5 ${multiline ? "items-start" : "items-center"} rounded-2xl bg-card border-2 border-line-strong shadow-sticker-lg px-2 py-1.5 focus-within:border-tangerine transition-colors`}>
           {/* W2.1: "+" attach menu — always visible; entries gate honestly. */}
           <div className="relative shrink-0">
             <button
@@ -2398,8 +2423,9 @@ function RunRail({
                 aria-expanded={open === a.key}
                 aria-label={`${a.name}${a.caption ? ` — ${a.caption}` : ""} (${a.state})`}
                 // The hue is INLINE, not a class: Tailwind's scanner never sees
-                // a computed class name and would emit nothing.
-                style={{ backgroundColor: `hsl(${a.hue} 70% 92%)`, color: `hsl(${a.hue} 60% 30%)` }}
+                // a computed class name and would emit nothing. Saturation and
+                // lightness are styles.css's, so Appearance › Theme can darken them.
+                style={{ backgroundColor: `hsl(${a.hue} var(--run-chip-bg))`, color: `hsl(${a.hue} var(--run-chip-ink))` }}
                 // A2: enters with the brand's overshoot, and leaves by
                 // SHRINKING ONLY — no opacity in the exit.
                 //

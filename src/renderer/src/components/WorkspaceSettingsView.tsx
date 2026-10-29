@@ -40,12 +40,20 @@ export function WorkspaceSettingsView({
   const [model, setModel] = useState<{ provider: string; modelId: string } | null>(null);
   const [bypass, setBypass] = useState<boolean | null>(null); // #14: tri-state override
   const [confirmBypass, setConfirmBypass] = useState(false);
+  // §9: tri-state like bypass — null inherits the global Rewind setting.
+  const [fileRewind, setFileRewind] = useState<boolean | null>(null);
 
   useEffect(() => {
     void window.hv.listModels().then(setModels);
     void window.hv.getWorkspaceModel(workspace).then(setModel);
     void window.hv.getWorkspaceBypass(workspace).then(setBypass);
+    void window.hv.getWorkspaceFileRewind(workspace).then(setFileRewind);
   }, [workspace]);
+
+  const applyFileRewind = (v: boolean | null): void => {
+    setFileRewind(v);
+    void window.hv.setWorkspaceFileRewind(workspace, v);
+  };
 
   const applyBypass = (v: boolean | null): void => {
     setBypass(v);
@@ -125,7 +133,7 @@ export function WorkspaceSettingsView({
           </div>
 
           {confirmBypass && (
-            <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-ink/60 p-8" onClick={() => setConfirmBypass(false)}>
+            <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-scrim/60 p-8" onClick={() => setConfirmBypass(false)}>
               <div className="hv-dialog-flow w-full max-w-md rounded-2xl border-2 border-berry bg-card p-5 shadow-sticker-lg" onClick={(e) => e.stopPropagation()}>
                 <div className="font-bold text-berry mb-1">⚠ Auto-approve every action in this workspace?</div>
                 <p className="text-sm text-ink-soft mb-4">
@@ -151,6 +159,26 @@ export function WorkspaceSettingsView({
               </div>
             </div>
           )}
+        </Section>
+
+        <Section icon="rewind" title="Rewind" subtitle="Whether a rewind can put this project's files back.">
+          <div className="flex items-center gap-2">
+            <select
+              value={fileRewind === null ? "inherit" : fileRewind ? "on" : "off"}
+              onChange={(e) => applyFileRewind(e.target.value === "inherit" ? null : e.target.value === "on")}
+              aria-label="Keep a copy of this workspace's files for Rewind"
+              className="rounded-xl border-2 border-line bg-paper px-3 py-2 text-sm focus:outline-none focus:border-tangerine cursor-pointer"
+            >
+              <option value="inherit">Inherit global</option>
+              <option value="on">On — keep a copy of the files</option>
+              <option value="off">Off — no copy, every edit asks</option>
+            </select>
+          </div>
+          <p className="text-xs text-ink-soft mt-1.5">
+            Overrides the global setting on the Permissions page for this workspace. Off suits a folder too large to
+            copy, or one kept in the cloud: a rewind restores the conversation only, and the agent asks before every
+            edit, because it could not be undone. Open sessions here pick it up when they are idle.
+          </p>
         </Section>
 
         <Section icon="skills" title="Skills" subtitle="This project's skills, and which global ones are on here.">
@@ -253,7 +281,7 @@ function RemoveWorkspaceBlock({ workspace, onRemoved }: { workspace: string; onR
 
       {/* Same warm dialog pattern as the session-delete confirm and CompactDialog. */}
       {confirm && (
-        <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-ink/40 px-6" onMouseDown={() => setConfirm(null)}>
+        <div className="hv-overlay fixed inset-0 flex items-center justify-center bg-scrim/40 px-6" onMouseDown={() => setConfirm(null)}>
           <div
             className="hv-dialog-flow w-full max-w-md rounded-2xl bg-paper border-2 border-line-strong shadow-pop p-6"
             onMouseDown={(e) => e.stopPropagation()}

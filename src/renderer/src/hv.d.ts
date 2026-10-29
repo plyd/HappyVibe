@@ -1048,9 +1048,21 @@ interface HvApi {
   /** Round 29: `commands` (a shell prompt's patterns) writes command rules instead of a tool rule. */
   addPermissionRule(workspace: string | null, tool: string, commands?: string[]): Promise<HvRulesFile>;
   getAutoCompaction(): Promise<boolean>;
+  /** Appearance › Density: stored in config.json and pushed to every window. */
+  setDensity(d: "comfortable" | "compact" | "ultra-compact"): Promise<void>;
+  onDensityChanged(h: (d: "comfortable" | "compact" | "ultra-compact") => void): () => void;
+  /** Appearance › Theme: stored in config.json, handed to Electron's nativeTheme, pushed to every window. */
+  setColorScheme(s: "light" | "dark" | "system"): Promise<void>;
+  onColorSchemeChanged(h: (s: "light" | "dark" | "system") => void): () => void;
   setAutoCompaction(on: boolean): Promise<void>;
   /** Round 3 #14: persistent "bypass all permissions". */
   getGlobalBypass(): Promise<boolean>;
+  /** §9: Rewind keeps a copy of the workspace's files — global default (on), and a
+      per-workspace override (null = inherit). Off: no copies, and an edit asks. */
+  getGlobalFileRewind(): Promise<boolean>;
+  setGlobalFileRewind(on: boolean): Promise<void>;
+  getWorkspaceFileRewind(workspace: string): Promise<boolean | null>;
+  setWorkspaceFileRewind(workspace: string, on: boolean | null): Promise<void>;
   setGlobalBypass(on: boolean): Promise<void>;
   /** null = unset (inherit global). */
   getWorkspaceBypass(workspace: string): Promise<boolean | null>;
@@ -1231,6 +1243,10 @@ interface HvApi {
   boot: {
     windowId: number;
     record: { tabsByWs: unknown; ui: Record<string, string> };
+    /** Appearance › Density, at boot so the first frame already has it (main/density.ts). */
+    density?: "comfortable" | "compact" | "ultra-compact";
+    /** Appearance › Theme, at boot for the same reason (main/colorScheme.ts). */
+    colorScheme?: "light" | "dark" | "system";
     draft?: { tab: string; ws: string; draft: string };
   };
   moveTab(req: {
@@ -1467,6 +1483,8 @@ interface HvApi {
 
   interface Window {
     hv: HvApi;
+    /** Web mode (HV_SERVE): set by the browser shim (src/renderer/web), never in a window of the app. */
+    hvWeb?: true;
     /** §37: what `inlet-sdk/crash/electron-renderer` sends renderer reports
         through. The channel is fixed in the preload; this signature only
         matches the SDK's. */

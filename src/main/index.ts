@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { app, shell, BrowserWindow, nativeImage, Menu, ipcMain, screen, webFrameMain } from 'electron'
+import { app, shell, BrowserWindow, nativeImage, nativeTheme, Menu, ipcMain, screen, webFrameMain } from 'electron'
 import { join } from 'path'
 import { existsSync, renameSync } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -7,7 +7,7 @@ import icon from '../../resources/icon.png?asset'
 import { registerIpc } from './ipc'
 import { startUpdater } from './update'
 import { loginShellPath, mergePath } from './shellPath'
-import { getGitRulesSeeded, getLayoutFile, rulesFile, setGitRulesSeeded, setLayoutFile } from './config'
+import { getColorScheme, getDensity, getGitRulesSeeded, getLayoutFile, rulesFile, setGitRulesSeeded, setLayoutFile } from './config'
 import { seedDefaultGitRules } from './gitRules'
 import { guideLinkScript, navAction } from './navGuard'
 import { firstWindowSize, parseLayoutFile, type WindowRecord } from './windowLayout'
@@ -18,8 +18,14 @@ import { installRemoteConfig } from './remoteConfig'
 import { installUsage } from './usage'
 import { platform } from './platform'
 import { DOCS_BASE } from './docsBase'
+import { WINDOW_BACKGROUND } from './colorScheme'
 import { piMasterEnv } from './pi/spawn'
 import { wipeIfMarked } from './reset'
+import { isLoopback, serveConfig, type ServeConfig } from './web/serveConfig'
+import { tapIpc } from './web/ipcTap'
+// Type-only: the server (and `ws` with it) is loaded by serveWeb, never by a desktop run.
+import type { WebServer } from './web/server'
+import { WebWindow, type AppWindow } from './web/webWindow'
 
 // Force the app name so macOS shows "HappyVibe" (not "Electron") in the app menu
 // AND userData resolves to .../HappyVibe — in dev the process runs inside
@@ -30,6 +36,19 @@ app.setName('HappyVibe')
 
 // Privacy round: HV_NO_PHONE_HOME=1, before any Pi child exists, so all of them inherit it.
 Object.assign(process.env, piMasterEnv(process.env))
+
+// Web mode (src/main/web): HV_SERVE serves the app to browser tabs. Read once; a
+// value that cannot be what was meant stops here rather than serving somewhere unasked.
+let serve: ServeConfig | null = null
+try {
+  serve = serveConfig(process.env)
+} catch (err) {
+  console.error(`HappyVibe: ${err instanceof Error ? err.message : String(err)}`)
+  process.exit(1)
+}
+// Before the first ipcMain.handle below: the tap only sees what registers after it.
+const ipcTap = serve ? tapIpc(ipcMain) : null
+let webServer: WebServer | null = null
 
 // Inert unless set: points userData somewhere else, so a destructive flow (Clear
 // all data, §17 round 25) can be exercised without touching the real profile.
@@ -77,7 +96,14 @@ void installCrash((channel, payload) => windows.broadcast(channel, payload))
  * could create a SECOND window that registerIpc had never seen — deaf for its
  * whole life, which is the dock-click bug this fixes on the way past.
  */
-export const windows = new WindowRegistry<BrowserWindow>()
+export const windows = new WindowRegistry<AppWindow>()
+
+/**
+ * Web mode: the layouts restored at start that no tab has claimed yet, in
+ * order. Saved with the live ones so a restart finds them. Always empty on the
+ * desktop. (A tab that goes away keeps its window, dormant — webWindow.ts.)
+ */
+const parkedRecords: WindowRecord[] = []
 
 /** §37: webContents ids already reloaded after a renderer crash — one repair
     attempt each, so a view that dies on load does not loop. */
@@ -90,7 +116,7 @@ const reloadedAfterCrash = new Set<number>()
 let persistTimer: NodeJS.Timeout | null = null
 export function persistLayout(): void {
   if (persistTimer) clearTimeout(persistTimer)
-  persistTimer = setTimeout(() => setLayoutFile(windows.records() as WindowRecord[]), 300)
+  persistTimer = setTimeout(() => setLayoutFile([...(windows.records() as WindowRecord[]), ...parkedRecords]), 300)
 }
 
 /**
@@ -119,7 +145,9 @@ ipcMain.on('hv:window-boot', (e) => {
   const record = (w && (windows.record(w.id) as WindowRecord | undefined)) ?? { tabsByWs: {}, ui: {} }
   const draft = w ? pendingDrafts.get(w.id) : undefined
   if (w) pendingDrafts.delete(w.id)
-  e.returnValue = { windowId: w?.id ?? -1, record, ...(draft ? { draft } : {}) }
+  // Appearance › Density and Theme ride the boot too: read here, synchronously, a
+  // compact or dark app paints so from its first frame instead of jumping after an invoke.
+  e.returnValue = { windowId: w?.id ?? -1, record, density: getDensity(), colorScheme: getColorScheme(), ...(draft ? { draft } : {}) }
 })
 
 /**
@@ -188,6 +216,9 @@ ipcMain.handle('hv:drag-release', (e, _at: { x: number; y: number }, record: unk
   const w = windows.bySender(e.sender)
   const d = dragging
   if (!w || !d || d.windowId !== w.id) return false
+  // Web mode: a browser tab has no place on the screen main could compare a
+  // pointer with, so a drag out of one is never a move or a tear-off.
+  if (w instanceof WebWindow) return false
 
   /**
    * The POINTER, asked of the OS, not the `dragend` event's `screenX/screenY`.
@@ -207,7 +238,9 @@ ipcMain.handle('hv:drag-release', (e, _at: { x: number; y: number }, record: unk
    * most recently created — the one you most likely just made. Accepted, and
    * cheap to revisit if it ever bites.
    */
-  const under = windows.all().filter((win) => insideAny(at, [win.getBounds()]))
+  const under = windows
+    .all()
+    .filter((win): win is BrowserWindow => !(win instanceof WebWindow) && insideAny(at, [win.getBounds()]))
   const target = under.filter((win) => win.id !== w.id).at(-1) ?? null
   // Released over its own window with nothing accepting it: the tab stays.
   if (!target && under.some((win) => win.id === w.id)) return false
@@ -241,6 +274,8 @@ ipcMain.handle(
     },
   ): boolean => {
     if (req.target === 'new') {
+      // Web mode: a page cannot open a window of the app — the tab menu hides this there.
+      if (windows.bySender(e.sender) instanceof WebWindow) return false
       const record = req.record as WindowRecord | undefined
       if (!record) return false
       const w = openWindow(record, req.at)
@@ -267,6 +302,8 @@ export function openWindow(record: WindowRecord, at?: { x: number; y: number }):
     // a first launch and for ⌘⇧N.
     ...(at ? { x: at.x, y: at.y } : record.bounds ? { x: record.bounds.x, y: record.bounds.y } : {}),
     show: false,
+    // Appearance › Theme: what shows behind the page while it loads or resizes.
+    backgroundColor: WINDOW_BACKGROUND[nativeTheme.shouldUseDarkColors ? 'dark' : 'light'],
     autoHideMenuBar: true,
     // macOS IGNORES the window icon — there the Dock is the surface, set below
     // via app.dock.setIcon. Windows and Linux both read this option, and in DEV
@@ -374,6 +411,15 @@ app.whenReady().then(() => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('dev.happyvibe.app')
 
+  // Appearance › Theme (colorScheme.ts), before the first window: menus, dialogs
+  // and scrollbars follow it, and so does the renderer's prefers-color-scheme.
+  nativeTheme.themeSource = getColorScheme()
+  // On "Match system", the computer can switch while the app runs.
+  nativeTheme.on('updated', () => {
+    const bg = WINDOW_BACKGROUND[nativeTheme.shouldUseDarkColors ? 'dark' : 'light']
+    for (const w of windows.all()) if (!w.isDestroyed() && 'setBackgroundColor' in w) w.setBackgroundColor(bg)
+  })
+
   // Dev dock icon: packaged builds use build/icon.icns (electron-builder), but
   // in dev the dock would show the default Electron icon — set ours explicitly.
   if (process.platform === 'darwin' && app.dock) {
@@ -468,7 +514,11 @@ app.whenReady().then(() => {
   // tabs, workspace, chrome and bounds. No records (first launch, or a corrupt
   // file) means exactly one default window — never zero.
   const restored = parseLayoutFile(getLayoutFile())
-  if (restored.length === 0) openWindow({ tabsByWs: {}, ui: {} })
+  if (serve) {
+    // Web mode: no window of its own. Each browser tab claims one of these, in order.
+    parkedRecords.push(...restored)
+    app.dock?.hide()
+  } else if (restored.length === 0) openWindow({ tabsByWs: {}, ui: {} })
   else for (const record of restored) openWindow(record)
 
   // A GUI-launched app inherits launchd's minimal PATH, so nvm node, uv and
@@ -493,7 +543,20 @@ app.whenReady().then(() => {
   }
 
   // §38: the updater takes the live facts its restart gate needs from registerIpc.
-  startUpdater(registerIpc(windows, persistLayout, () => openWindow({ tabsByWs: {}, ui: {} })))
+  // Web mode: "open a window" (a notification click with none open) means the
+  // page, in the browser — the plain URL: the token never goes on a command line.
+  const openAppWindow = (): BrowserWindow | null => {
+    if (!serve) return openWindow({ tabsByWs: {}, ui: {} })
+    if (webServer) void shell.openExternal(webServer.url)
+    return null
+  }
+  // Web mode: no self-update. The relaunch that installs one would come back
+  // without HV_SERVE, as a desktop window the tabs cannot reconnect to.
+  if (serve) process.env.HV_NO_UPDATE_CHECK = '1'
+  startUpdater(registerIpc(windows, persistLayout, openAppWindow))
+
+  // Web mode: after registerIpc, so the first tab finds every handler in place.
+  if (serve) void serveWeb(serve)
 
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the
@@ -508,10 +571,73 @@ app.whenReady().then(() => {
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  // Web mode: the server is the app; a window opened beside it does not end it.
+  if (process.platform !== 'darwin' && !serve) {
     app.quit()
   }
 })
+
+/** A server that could not start is a failed run: the normal quit (children, layout), then exit code 1 for whatever launched it. */
+function quitFailed(): void {
+  app.once('quit', () => process.exit(1))
+  app.quit()
+}
+
+/**
+ * Web mode — start the server, and print the one link that opens it.
+ *
+ * It serves the BUILT renderer (out/renderer/web.html): `npm run dev` keeps the
+ * renderer in Vite's memory, so web mode runs from `npm start` or an installed app.
+ */
+async function serveWeb(cfg: ServeConfig): Promise<void> {
+  const rendererDir = join(__dirname, '../renderer')
+  if (!existsSync(join(rendererDir, 'web.html'))) {
+    console.error(`HappyVibe: web mode serves the built renderer, and ${rendererDir} has no web.html. Use \`npm start\` (it builds first), not \`npm run dev\`.`)
+    quitFailed()
+    return
+  }
+  try {
+    const { startWebServer } = await import('./web/server')
+    webServer = await startWebServer(
+      { ...cfg, rendererDir, platform: platform.name },
+      {
+        open: (win) => {
+          windows.add(win, parkedRecords.shift() ?? { tabsByWs: {}, ui: {} })
+          win.on('closed', () => windowsChanged())
+        },
+        // A tab came back to a dormant window, or left one: the window list changes.
+        changed: () => windowsChanged(),
+        sync: ipcTap!.sync,
+        invoke: ipcTap!.invoke,
+        send: ipcTap!.send,
+      },
+    )
+  } catch (err) {
+    console.error(`HappyVibe: could not serve on ${cfg.host}:${cfg.port} — ${err instanceof Error ? err.message : String(err)}`)
+    quitFailed()
+    return
+  }
+  // Ctrl+C in the terminal that started it quits the app properly — Pi children,
+  // terminals and the layout file included — instead of killing main mid-write.
+  // A second one, if that quit hangs, forces it.
+  let quitting = false
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(signal, () => {
+      if (quitting) app.exit(130)
+      quitting = true
+      app.quit()
+    })
+  }
+  console.log(`\nHappyVibe is serving at ${webServer.url}`)
+  console.log(`Open this link once — it carries the access token:\n\n  ${webServer.loginUrl}\n`)
+  // From Windows into WSL, one loopback name can be forwarded when the other is not.
+  if (webServer.loginUrl.startsWith('http://127.0.0.1:')) {
+    console.log(`or the same through localhost:\n\n  ${webServer.loginUrl.replace('http://127.0.0.1:', 'http://localhost:')}\n`)
+  }
+  if (!isLoopback(cfg.host)) {
+    console.log(`Listening on ${cfg.host}, over plain HTTP: anyone on the network who sees the traffic or the link can run commands on this machine. From another computer, prefer an SSH tunnel to the default 127.0.0.1 (ssh -L ${cfg.port}:127.0.0.1:${cfg.port} this-machine).\n`)
+  }
+}
 
 // In this file you can include the rest of your app's specific main process
 // code. You can also put them in separate files and require them here.

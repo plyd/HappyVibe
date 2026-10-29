@@ -65,6 +65,10 @@ contextBridge.exposeInMainWorld("hv", {
   boot: ipcRenderer.sendSync("hv:window-boot") as {
     windowId: number;
     record: { tabsByWs: unknown; ui: Record<string, string> };
+    /** Appearance › Density, at boot so the first frame already has it (main/density.ts). */
+    density: "comfortable" | "compact" | "ultra-compact";
+    /** Appearance › Theme, at boot for the same reason (main/colorScheme.ts). */
+    colorScheme: "light" | "dark" | "system";
     /** §7 round 23: unsaved text of a tab moved into this brand-new window. */
     draft?: { tab: string; ws: string; draft: string };
   },
@@ -340,8 +344,25 @@ contextBridge.exposeInMainWorld("hv", {
   addPermissionRule: (workspace: string | null, tool: string, commands?: string[]) =>
     ipcRenderer.invoke("hv:add-permission-rule", workspace, tool, commands),
   getAutoCompaction: () => ipcRenderer.invoke("hv:get-auto-compaction"),
+  setDensity: (d: "comfortable" | "compact" | "ultra-compact") => ipcRenderer.invoke("hv:set-density", d),
+  onDensityChanged: (h: (d: "comfortable" | "compact" | "ultra-compact") => void) => {
+    const l = (_e: unknown, d: "comfortable" | "compact" | "ultra-compact"): void => h(d);
+    ipcRenderer.on("hv:density-changed", l);
+    return () => ipcRenderer.off("hv:density-changed", l);
+  },
+  setColorScheme: (s: "light" | "dark" | "system") => ipcRenderer.invoke("hv:set-color-scheme", s),
+  onColorSchemeChanged: (h: (s: "light" | "dark" | "system") => void) => {
+    const l = (_e: unknown, s: "light" | "dark" | "system"): void => h(s);
+    ipcRenderer.on("hv:color-scheme-changed", l);
+    return () => ipcRenderer.off("hv:color-scheme-changed", l);
+  },
   setAutoCompaction: (on: boolean) => ipcRenderer.invoke("hv:set-auto-compaction", on),
   getGlobalBypass: () => ipcRenderer.invoke("hv:get-global-bypass"),
+  getGlobalFileRewind: () => ipcRenderer.invoke("hv:get-global-file-rewind"),
+  setGlobalFileRewind: (on: boolean) => ipcRenderer.invoke("hv:set-global-file-rewind", on),
+  getWorkspaceFileRewind: (workspace: string) => ipcRenderer.invoke("hv:get-workspace-file-rewind", workspace),
+  setWorkspaceFileRewind: (workspace: string, on: boolean | null) =>
+    ipcRenderer.invoke("hv:set-workspace-file-rewind", workspace, on),
   setGlobalBypass: (on: boolean) => ipcRenderer.invoke("hv:set-global-bypass", on),
   getWorkspaceBypass: (workspace: string) => ipcRenderer.invoke("hv:get-workspace-bypass", workspace),
   setWorkspaceBypass: (workspace: string, on: boolean | null) =>

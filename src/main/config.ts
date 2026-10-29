@@ -14,7 +14,9 @@ import { PRIVACY_SWITCHES, lockedByEnv, type Env, type SwitchKey } from "./priva
 import { OFFICIAL_MARKETPLACE } from "./plugins/officialMarketplace";
 import { mergeTerminalSettings, type TerminalSettings } from "./terminalSettings";
 import { mergeVoiceSettings, type VoiceSettings } from "./voice/settings";
-import { disabledAgentOverrides, tintinwebSettings, withCompaction } from "./subagentSettings";
+import { disabledAgentOverrides, tintinwebSettings, withCompaction, withRetryPolicy } from "./subagentSettings";
+import { DEFAULT_DENSITY, isDensity, type Density } from "./density";
+import { DEFAULT_COLOR_SCHEME, isColorScheme, type ColorScheme } from "./colorScheme";
 import { resolveWebService, type ResolvedWebService } from "./webTools";
 import { webDefaultServiceAllowed } from "./remoteConfig/client";
 
@@ -59,6 +61,10 @@ interface ConfigFile {
   /** §38: set only when the user turns OFF automatic update downloads (default on). */
   autoUpdate?: false;
   workspaceBypass?: Record<string, boolean>;
+  /** §9: Rewind keeps a copy of the workspace's files — global default + per-workspace
+      override (the bypass shape). Set only when OFF (absent = on). */
+  fileRewindOff?: true;
+  workspaceFileRewind?: Record<string, boolean>;
   /** §14 Skills: external skill dirs linked in place (e.g. ~/.claude/skills).
       Scanned for skills that still go through review-before-active. */
   linkedSkillDirs?: string[];
@@ -84,6 +90,10 @@ interface ConfigFile {
   longCache?: boolean;
   /** §9 round 28: global auto-compaction switch; absent = ON (Pi's own default). */
   autoCompaction?: boolean;
+  /** Appearance › Density (density.ts). Absent ⇒ comfortable. */
+  density?: string;
+  /** Appearance › Theme (colorScheme.ts). Absent ⇒ light. */
+  colorScheme?: string;
   /** §13 round 27: the user's image model. Absent ⇒ the cheapest priced one (resolveImageModel). */
   imageModel?: string;
   /** §13 round 8: safeStorage-encrypted secrets for catalog-installed MCP
@@ -400,6 +410,38 @@ export function setWorkspaceBypass(workspace: string, on: boolean | null): void 
   else cfg.workspaceBypass[workspace] = on;
   if (Object.keys(cfg.workspaceBypass).length === 0) delete cfg.workspaceBypass;
   save(cfg);
+}
+
+/** §9: Rewind's copy of the files, global default (on unless turned off). */
+export function getGlobalFileRewind(): boolean {
+  return !load().fileRewindOff;
+}
+
+export function setGlobalFileRewind(on: boolean): void {
+  const cfg = load();
+  if (on) delete cfg.fileRewindOff;
+  else cfg.fileRewindOff = true;
+  save(cfg);
+}
+
+/** Per-workspace override, tri-state: null = unset (inherit global). */
+export function getWorkspaceFileRewind(workspace: string): boolean | null {
+  return load().workspaceFileRewind?.[workspace] ?? null;
+}
+
+export function setWorkspaceFileRewind(workspace: string, on: boolean | null): void {
+  const cfg = load();
+  cfg.workspaceFileRewind ??= {};
+  if (on === null) delete cfg.workspaceFileRewind[workspace];
+  else cfg.workspaceFileRewind[workspace] = on;
+  if (Object.keys(cfg.workspaceFileRewind).length === 0) delete cfg.workspaceFileRewind;
+  save(cfg);
+}
+
+/** Resolved for a workspace (a project — a worktree reads its project's): override ?? global. */
+export function resolveFileRewind(workspace: string | null | undefined): boolean {
+  const cfg = load();
+  return (workspace ? cfg.workspaceFileRewind?.[workspace] : undefined) ?? !cfg.fileRewindOff;
 }
 
 /** Resolved bypass for a session: workspace override ?? global ?? off. */
@@ -876,6 +918,30 @@ export function writeSubagentSettings(): void {
   fs.writeFileSync(file, `${JSON.stringify(disabledAgentOverrides(settings, load().agentsEnabled ?? {}), null, 2)}\n`);
 }
 
+/** Appearance › Density — anything unrecognised reads as the default, never as a broken layout. */
+export function getDensity(): Density {
+  const d = load().density;
+  return isDensity(d) ? d : DEFAULT_DENSITY;
+}
+
+export function setDensity(d: Density): void {
+  const cfg = load();
+  cfg.density = d;
+  save(cfg);
+}
+
+/** Appearance › Theme — anything unrecognised reads as the default, never as half a theme. */
+export function getColorScheme(): ColorScheme {
+  const s = load().colorScheme;
+  return isColorScheme(s) ? s : DEFAULT_COLOR_SCHEME;
+}
+
+export function setColorScheme(s: ColorScheme): void {
+  const cfg = load();
+  cfg.colorScheme = s;
+  save(cfg);
+}
+
 export function getAutoCompaction(): boolean {
   return load().autoCompaction ?? true;
 }
@@ -900,6 +966,21 @@ export function writePiCompactionSetting(): void {
     /* absent or corrupt — start fresh */
   }
   fs.writeFileSync(file, `${JSON.stringify(withCompaction(settings, getAutoCompaction()), null, 2)}\n`);
+}
+
+/**
+ * HappyVibe's retry policy as Pi's `retry` settings (providerError.ts `RETRY_POLICY`), for every
+ * later spawn. Same read-merge-write as the two above.
+ */
+export function writePiRetrySetting(): void {
+  const file = path.join(agentDir(), "settings.json");
+  let settings: Record<string, unknown> = {};
+  try {
+    settings = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  } catch {
+    /* absent or corrupt — start fresh */
+  }
+  fs.writeFileSync(file, `${JSON.stringify(withRetryPolicy(settings), null, 2)}\n`);
 }
 
 /**

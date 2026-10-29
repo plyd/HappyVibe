@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ClipboardItem, dialog, ipcMain, nativeImage, Notification, powerMonitor, shell, systemPreferences } from "electron";
+import { app, BrowserWindow, clipboard, ClipboardItem, dialog, ipcMain, nativeImage, nativeTheme, Notification, powerMonitor, shell, systemPreferences } from "electron";
 import { SessionGrants } from "./sessionGrants";
 import { lastDecidedByScope } from "./ruleUsage";
 import { parseImageDataUrl } from "./imageData";
@@ -28,8 +28,8 @@ import { buildDocumentBlocks, convertDocument, probeDocuments } from "./document
 import { DOCUMENT_EXTENSIONS, documentErrorSentence, documentErrorUserMessage, documentExtension, isDocumentPath } from "../../pi-runtime/extensions/hv-document";
 import {
   agentDir, builtinAgentsDir, getBuiltinTools, getDefaultModel, getDefaultThinking, setDefaultThinking, getGlobalBypass, getLinkedPromptTemplateDirs, getLinkedSkillDirs, getLongCache, getImageModel, setImageModel, getOnboardingSeen, getOpenFilesContext, setOpenFilesContext,
-  customKeyStatus, getWorkspaceBypass, installBuiltinAgents, listCustomEndpoints, providerEnv, providerKeyStatus, removeCustomEndpoint, removeProviderKey,
-  saveCustomEndpoint, setAgentEnabled, setLinkedPromptTemplateDirs, setLinkedSkillDirs, writeSubagentSettings, writeTintinwebSettings, getAutoCompaction, setAutoCompaction, writePiCompactionSetting,
+  customKeyStatus, getWorkspaceBypass, getGlobalFileRewind, setGlobalFileRewind, getWorkspaceFileRewind, setWorkspaceFileRewind, resolveFileRewind, installBuiltinAgents, listCustomEndpoints, providerEnv, providerKeyStatus, removeCustomEndpoint, removeProviderKey,
+  saveCustomEndpoint, setAgentEnabled, setLinkedPromptTemplateDirs, setLinkedSkillDirs, writeSubagentSettings, writeTintinwebSettings, getAutoCompaction, setAutoCompaction, writePiCompactionSetting, writePiRetrySetting, setDensity, setColorScheme,
   resolveBypass, rulesFile, sessionDir, snapshotDir, setBuiltinTools, setDefaultModel, setGlobalBypass, setLongCache, setOnboardingSeen,
   getStarNudgeUntil, snoozeStarNudge,
   setProviderKey, setWorkspaceBypass, setMcpSecret, removeMcpSecrets, getShortcuts, setShortcuts, getMcpRulesMigrated, setMcpRulesMigrated,
@@ -133,10 +133,7 @@ import {
 import { DEFAULT_DIFF_BUDGET, buildDraftPrompt, buildPrPrompt, draftCommitMessage, draftPullRequest } from "./gitMessage";
 import { humaniseBranch, parseRemote, pullRequestUrl } from "./gitForge";
 import { listPlanProgress, readPlan, setPlanStatus, writePlanFile, PLAN_DIR } from "./plans";
-import {
-  captureSnapshot, deleteSessionSnapshots, discardSnapshot, findRestoreTarget, listSnapshots,
-  previewRestore, restoreSnapshot, stampSnapshot,
-} from "./snapshots";
+import { SNAPSHOT_BUDGET_MS, snapshotHost } from "./snapshotHost";
 import { buildPlanPrompt, shouldReconcilePlanOff, type PlanStatus } from "../../pi-runtime/extensions/hv-plan";
 import { buildTerminalPrompt } from "../../pi-runtime/extensions/hv-terminal";
 import { buildMemoryPrompt } from "../../pi-runtime/extensions/hv-memory";
@@ -159,6 +156,9 @@ import { parseScheduleEnvelope, permissionSummary, renderScheduleList } from "./
 import { Scheduler, type NotifyExtra, type ScheduleEventType } from "./scheduler";
 import { catalogEntry, buildCatalogInstall } from "./mcpCatalog";
 import type { WindowRegistry } from "./windows";
+import { WebWindow, type AppWindow } from "./web/webWindow";
+import { isDensity } from "./density";
+import { isColorScheme, WINDOW_BACKGROUND } from "./colorScheme";
 import type { WindowRecord } from "./windowLayout";
 import { promptWindowFor } from "./promptRouting";
 
@@ -247,7 +247,7 @@ export function promptTemplateNotifyMessage(
 
 /** Which config source a live respawn is applying — cosmetic, shown in the renderer notice
     (one line per value in src/renderer/src/reloadNotice.ts, pinned by tests/mcp-reload-copy.test.ts). */
-type ReloadReason = "mcp" | "skills" | "promptTemplates" | "tools";
+type ReloadReason = "mcp" | "skills" | "promptTemplates" | "tools" | "fileRewind";
 
 /** §23: a plan-family notify (hv.plan | hv.plan-status | hv.plan.blocked), else null. */
 function parsePlanNotify(r: { method?: string; message?: string }): Record<string, unknown> | null {
@@ -558,7 +558,7 @@ export interface UpdateDeps {
 }
 
 export function registerIpc(
-  windows: WindowRegistry<BrowserWindow>,
+  windows: WindowRegistry<AppWindow>,
   /** index.ts owns the layout file (it owns the registry); passed in rather than
       imported so ipc.ts and index.ts do not form a cycle. */
   persistLayout: () => void,
@@ -566,9 +566,10 @@ export function registerIpc(
    * §35: open a window. Passed in for the same no-cycle reason as persistLayout.
    * A scheduled run's notification can be clicked while the app is running with
    * every window closed (macOS keeps it alive), and there is then nothing to
-   * focus — so the click has to be able to make one.
+   * focus — so the click has to be able to make one. In web mode there is no
+   * window to make: it opens the page in the browser and returns null.
    */
-  openWindow: () => BrowserWindow,
+  openWindow: () => AppWindow | null,
 ): UpdateDeps {
   /**
    * §7 round 23 — ONE push helper, and it fans out to every window.
@@ -584,15 +585,36 @@ export function registerIpc(
    * The window an ipc call came from. A modal dialog must parent on it — before
    * round 23 all seven parented on the one captured window, which in a second
    * window would put the sheet on somebody else's title bar.
+   *
+   * Web mode: a browser tab is no window a sheet can hang from, so for one this
+   * is null and the dialog opens on its own (see `openDialog`).
    */
-  const ownerOf = (e: { sender: { id: number } }): BrowserWindow => {
+  const ownerOf = (e: { sender: { id: number } }): BrowserWindow | null => {
     const w = windows.bySender(e.sender) ?? windows.primary();
     // Unreachable: the event itself proves a live renderer, whose window is
-    // either still registered or outlived by another. Non-null so a dialog can
-    // parent unconditionally; a throw here rejects the invoke, which every
-    // caller already handles, rather than parenting a sheet on nothing.
+    // either still registered or outlived by another. A throw here rejects the
+    // invoke, which every caller already handles, rather than parenting a sheet
+    // on nothing.
     if (!w) throw new Error("no window to parent a dialog on");
-    return w;
+    return w instanceof WebWindow ? null : w;
+  };
+  /**
+   * A native folder/file dialog for the caller. From a browser tab it opens
+   * unparented on the machine running the app — the one the tab is on, when it
+   * is local (with WSLg, on the Windows desktop) — and is brought to the front,
+   * because an app serving in the background is behind the browser.
+   */
+  const openDialog = (e: { sender: { id: number } }, options: Electron.OpenDialogOptions) => {
+    const owner = ownerOf(e);
+    if (owner) return dialog.showOpenDialog(owner, options);
+    app.focus({ steal: true });
+    return dialog.showOpenDialog(options);
+  };
+  const saveDialog = (e: { sender: { id: number } }, options: Electron.SaveDialogOptions) => {
+    const owner = ownerOf(e);
+    if (owner) return dialog.showSaveDialog(owner, options);
+    app.focus({ steal: true });
+    return dialog.showSaveDialog(options);
   };
   // §27: whole-state voice snapshots, same broadcast shape as
   // hv:mcp-status-changed. The facade already throttles to ~4 Hz — a 652 MB
@@ -840,6 +862,13 @@ export function registerIpc(
    * session ends (an id is never reused).
    */
   const lastOpenFiles = new Map<string, string[]>();
+  // §9: a session's "pre" capture in flight. A message sent to the same session
+  // while it runs waits for it, so the two reach Pi in the order they were sent.
+  const pendingPre = new Map<string, Promise<unknown>>();
+  // §9: whether Rewind keeps a copy of this workspace's files (Settings › Permissions ›
+  // Rewind, or the workspace's override). Read per capture, so a change applies to the
+  // next message; a worktree reads its project's setting, like bypass.
+  const fileRewindOn = (workspaceId: string): boolean => resolveFileRewind(worktrees.projectOf(workspaceId));
   /**
    * §26 part 2: the same idea for the terminals a session started. The RENDERED
    * block is stored rather than the list, because it is sorted and therefore
@@ -891,6 +920,12 @@ export function registerIpc(
     writePiCompactionSetting();
   } catch (e) {
     console.warn("[hv] compaction setting write failed:", e);
+  }
+  // A dropped connection pauses the turn for minutes instead of ending it (providerError.ts RETRY_POLICY).
+  try {
+    writePiRetrySetting();
+  } catch (e) {
+    console.warn("[hv] retry setting write failed:", e);
   }
 
   // §5 (2026-08-29): reclaim sub-agent data whose session is already gone. Before
@@ -1067,6 +1102,8 @@ export function registerIpc(
       // #14: persistent bypass resolved workspace ?? global ?? off; re-applied on
       // every (re)spawn so it survives respawns (unlike session dangerous mode).
       bypass,
+      // §9: Rewind's copy of the files, resolved like bypass. Off ⇒ an edit asks (HV_FILE_REWIND=0).
+      fileRewind: resolveFileRewind(project ?? null),
       // Round 29: "Allow for session" survives the respawn (never a fork — a fork is a new id).
       grants: sessionId ? sessionGrants.list(sessionId) : undefined,
       // §35: a run whose schedule says Read-only spawns clamped. Re-derived here
@@ -1248,8 +1285,8 @@ export function registerIpc(
     const n = new Notification({ title: "HappyVibe", body, silent });
     n.on("click", () => {
       const w = windows.primary() ?? openWindow();
-      w.show();
-      w.focus();
+      w?.show();
+      w?.focus();
       onClick();
     });
     n.show();
@@ -1709,17 +1746,18 @@ export function registerIpc(
       // §9 rewind: stamp the pending "pre" snapshot with the turn's FIRST
       // toolCallId (the only id durable across a reload), and record what the
       // agent left behind at agent_end — that record is the stale-check's
-      // reference. Best-effort: snapshotting must never disturb the stream.
+      // reference. Best-effort and queued on the snapshot worker, which keeps
+      // them in this order: snapshotting must never disturb the stream.
       const snapWsId = index.get(sessionId)?.workspaceId;
       if (snapWsId) {
         try {
           if (e.type === "tool_execution_start" && typeof e.toolCallId === "string") {
-            stampSnapshot(snapshotDir(), sessionId, e.toolCallId);
-          } else if (e.type === "agent_end") {
-            captureSnapshot(
-              snapshotDir(), sessionId, roots(), snapWsId,
-              "post", new Date().toISOString(),
-            );
+            void snapshotHost.stamp(snapshotDir(), sessionId, e.toolCallId).catch(() => {});
+          } else if (e.type === "agent_end" && fileRewindOn(snapWsId)) {
+            void snapshotHost.capture(
+              { root: snapshotDir(), sessionId, roots: roots(), workspaceId: snapWsId, kind: "post", now: new Date().toISOString() },
+              SNAPSHOT_BUDGET_MS.post,
+            ).catch(() => {});
           }
         } catch {
           /* never disturb the event stream */
@@ -2977,7 +3015,7 @@ export function registerIpc(
     return dir;
   });
   ipcMain.handle("hv:add-workspace", async (e) => {
-    const r = await dialog.showOpenDialog(ownerOf(e), { properties: ["openDirectory"] });
+    const r = await openDialog(e, { properties: ["openDirectory"] });
     if (r.canceled || !r.filePaths[0]) return null;
     workspaces.add(r.filePaths[0]);
     const count = workspaces.list().length;
@@ -3017,7 +3055,7 @@ export function registerIpc(
         // artifacts are filed under exist only inside it.
         deleteSessionChildren(sessionDir(), s.piSessionFile);
         deleteSessionFile(sessionDir(), s.piSessionFile);
-        deleteSessionSnapshots(snapshotDir(), s.id);
+        void snapshotHost.deleteSession(snapshotDir(), s.id).catch(() => {});
         void log.append({ type: "session.delete", sessionId: s.id, workspaceId: s.workspaceId });
         forgetSessionFeatures(s.id);
       }
@@ -3273,7 +3311,7 @@ export function registerIpc(
     // a special case. Still before deleteSessionFile, for the same reason.
     deleteSessionChildren(sessionDir(), meta.piSessionFile);
     deleteSessionFile(sessionDir(), meta.piSessionFile);
-    deleteSessionSnapshots(snapshotDir(), sessionId);
+    void snapshotHost.deleteSession(snapshotDir(), sessionId).catch(() => {});
     lastOpenFiles.delete(sessionId);
     lastOpenTerminals.delete(sessionId);
     lastOpenBrowser.delete(sessionId);
@@ -3329,7 +3367,7 @@ export function registerIpc(
     // A session title is free text and routinely holds a slash or a colon,
     // which macOS and Windows both refuse in a filename.
     const safe = (meta.title || "session").replace(/[/\\?%*:|"<>]/g, "-").slice(0, 80).trim() || "session";
-    const r = await dialog.showSaveDialog(ownerOf(e), {
+    const r = await saveDialog(e, {
       title: "Export session as HTML",
       defaultPath: `${safe}.html`,
       filters: [{ name: "HTML page", extensions: ["html"] }],
@@ -3351,7 +3389,7 @@ export function registerIpc(
     const img = parseImageDataUrl(dataUrl);
     if (!img) throw new Error("That picture can't be saved.");
     const base = (typeof name === "string" ? name : "image").replace(/[/\\?%*:|"<>]/g, "-").replace(/\.[a-z0-9]+$/i, "").slice(0, 80).trim() || "image";
-    const r = await dialog.showSaveDialog(ownerOf(e), {
+    const r = await saveDialog(e, {
       title: "Save picture",
       defaultPath: `${base}.${img.ext}`,
       filters: [{ name: "Image", extensions: [img.ext] }],
@@ -3402,7 +3440,7 @@ export function registerIpc(
     // deleteSessionFile — the artifact ids are only readable while it exists.
     deleteSessionChildren(sessionDir(), meta.piSessionFile);
     deleteSessionFile(sessionDir(), meta.piSessionFile);
-    deleteSessionSnapshots(snapshotDir(), sessionId); // §9: snapshots die with the session
+    void snapshotHost.deleteSession(snapshotDir(), sessionId).catch(() => {}); // §9: snapshots die with the session
     lastOpenFiles.delete(sessionId); // round 11: no stale set for a dead session
     lastOpenTerminals.delete(sessionId); // §26: same, for the terminals block
     lastOpenBrowser.delete(sessionId); // §28: …and for the browser block
@@ -3841,19 +3879,30 @@ export function registerIpc(
     // (restores LESS than asked) or on nothing at all. The confirm dialog
     // reports the "nothing" case and disables Rewind when that is the whole
     // outcome (ChatView rewind confirm).
+    //
+    // The capture runs on the snapshot worker and this message WAITS for it
+    // (up to SNAPSHOT_BUDGET_MS.pre): it is the state before the turn, so it
+    // must be complete before Pi can write a file. Past the budget the message
+    // goes without one. A message sent meanwhile to the same session waits for
+    // this capture too (`pendingPre`), so it cannot reach Pi first.
     let snap: { seq: number } | null = null;
-    if (!wasBusy && meta?.workspaceId) {
-      try {
-        snap = captureSnapshot(
-          snapshotDir(), sessionId, roots(), meta.workspaceId,
-          "pre", new Date().toISOString(),
-        );
-      } catch (e) {
+    const ahead = pendingPre.get(sessionId);
+    if (!wasBusy && meta?.workspaceId && fileRewindOn(meta.workspaceId)) {
+      const capture = snapshotHost.capture(
+        { root: snapshotDir(), sessionId, roots: roots(), workspaceId: meta.workspaceId, kind: "pre", now: new Date().toISOString() },
+        SNAPSHOT_BUDGET_MS.pre,
+      ).catch((e: unknown) => {
         void log.append({
           type: "rewind.capture_failed", sessionId, workspaceId: meta.workspaceId,
           data: { error: e instanceof Error ? e.message : String(e) },
         });
-      }
+        return null;
+      });
+      pendingPre.set(sessionId, capture);
+      snap = await capture;
+      if (pendingPre.get(sessionId) === capture) pendingPre.delete(sessionId);
+    } else if (ahead) {
+      await ahead;
     }
     // §35: when the turn started, for the run's duration. Set for every prompt
     // so a user-prompted run is measured the same way.
@@ -3883,7 +3932,7 @@ export function registerIpc(
     // §39: a prompt that started no turn of its own must not leave one open.
     const undo = (): void => {
       if (startedHere) turns.discard(sessionId);
-      if (snap) discardSnapshot(snapshotDir(), sessionId, snap.seq);
+      if (snap) void snapshotHost.discard(snapshotDir(), sessionId, snap.seq).catch(() => {});
     };
     let out;
     try {
@@ -3983,35 +4032,28 @@ export function registerIpc(
   // §9 rewind file rollback. HUMAN-ONLY by construction: these are IPC handlers
   // with no tool, no bridge command and no model-reachable path — the same
   // invariant as the plan-mode power transitions.
-  const rewindTarget = (sessionId: string, toolCallIds: string[]) => {
+  // Both run on the snapshot worker (snapshotHost.ts): each walks the workspace.
+  ipcMain.handle("hv:rewind-preview", async (_e, sessionId: string, toolCallIds: string[]) => {
     const meta = index.get(sessionId);
     if (!meta?.workspaceId) return null;
-    const target = findRestoreTarget(snapshotDir(), sessionId, toolCallIds);
-    return target ? { workspaceId: meta.workspaceId, target } : null;
-  };
-
-  ipcMain.handle("hv:rewind-preview", (_e, sessionId: string, toolCallIds: string[]) => {
-    const hit = rewindTarget(sessionId, toolCallIds);
-    if (!hit) return null;
-    return previewRestore(
-      snapshotDir(), sessionId, roots(), hit.workspaceId, hit.target,
-    );
+    return snapshotHost.preview(snapshotDir(), sessionId, roots(), meta.workspaceId, toolCallIds);
   });
 
-  ipcMain.handle("hv:rewind-restore", (_e, sessionId: string, toolCallIds: string[]) => {
-    const hit = rewindTarget(sessionId, toolCallIds);
-    if (!hit) return null;
-    const result = restoreSnapshot(
-      snapshotDir(), sessionId, roots(), hit.workspaceId,
-      hit.target, new Date().toISOString(),
+  ipcMain.handle("hv:rewind-restore", async (_e, sessionId: string, toolCallIds: string[]) => {
+    const meta = index.get(sessionId);
+    if (!meta?.workspaceId) return null;
+    const hit = await snapshotHost.restore(
+      snapshotDir(), sessionId, roots(), meta.workspaceId, toolCallIds, new Date().toISOString(),
     );
+    if (!hit) return null;
+    const { result } = hit;
     void log.append({
       type: "rewind.restore",
       sessionId,
-      workspaceId: hit.workspaceId,
+      workspaceId: meta.workspaceId,
       data: {
         who: "human",
-        seq: hit.target.seq,
+        seq: hit.seq,
         restored: result.restored.length,
         deleted: result.deleted.length,
         stale: result.stale,
@@ -4099,13 +4141,17 @@ export function registerIpc(
       const wsId = meta.workspaceId;
       // §23 round 7: the baseline "Revert implementation" restores to. Labelled,
       // so the per-session cap never evicts it. Best-effort — a snapshot failure
-      // must never block Implement.
-      try {
-        captureSnapshot(
-          snapshotDir(), sessionId, roots(), wsId,
-          "pre", new Date().toISOString(), "implement",
-        );
-      } catch { /* never block the handoff */ }
+      // must never block Implement — and on the snapshot worker, with the same
+      // budget and the same rule as a message's capture: complete before the turn.
+      if (fileRewindOn(wsId)) {
+        const capture = snapshotHost.capture(
+          { root: snapshotDir(), sessionId, roots: roots(), workspaceId: wsId, kind: "pre", now: new Date().toISOString(), label: "implement" },
+          SNAPSHOT_BUDGET_MS.pre,
+        ).catch(() => null); // never block the handoff
+        pendingPre.set(sessionId, capture);
+        await capture;
+        if (pendingPre.get(sessionId) === capture) pendingPre.delete(sessionId);
+      }
       const client = manager.get(sessionId) as PiClient | null;
       if (model && typeof model.provider === "string" && typeof model.modelId === "string") {
         index.update(sessionId, { model });
@@ -4161,17 +4207,13 @@ export function registerIpc(
   // §23 round 7: roll the workspace back to the Implement baseline. Human-only,
   // like every other power transition in this block. Files changed since the
   // agent touched them are left alone by the same stale-check rewind uses.
-  ipcMain.handle("hv:plan-revert", (_e, sessionId: string) => {
+  ipcMain.handle("hv:plan-revert", async (_e, sessionId: string) => {
     const meta = index.get(sessionId);
     if (!meta?.workspaceId) return null;
-    const target = listSnapshots(snapshotDir(), sessionId)
-      .filter((r) => r.label === "implement")
-      .pop();
-    if (!target) return null;
-    const result = restoreSnapshot(
-      snapshotDir(), sessionId, roots(), meta.workspaceId,
-      target, new Date().toISOString(),
+    const result = await snapshotHost.revertImplement(
+      snapshotDir(), sessionId, roots(), meta.workspaceId, new Date().toISOString(),
     );
+    if (!result) return null;
     void log.append({
       type: "plan.revert", sessionId, workspaceId: meta.workspaceId,
       data: {
@@ -4420,6 +4462,7 @@ export function registerIpc(
     // the bridge will answer — a preview that disagrees with the gate is worse than none.
     evaluate(readRules(), {
       tool, input, workspace: workspaceId, caseInsensitivePaths: platform.isWindows,
+      fileRewind: resolveFileRewind(worktrees.projectOf(workspaceId)),
     }));
 
   // ── §28 Embedded browser: the renderer's half ──────────────────────────────
@@ -4435,10 +4478,15 @@ export function registerIpc(
     // §7 round 23: the SENDER's window owns the pane from here on — a moved tab
     // re-parents on its new window's first bounds report, so there is no
     // separate move message that could disagree about where the page belongs.
+    //
+    // Web mode: a page cannot host a native view (BrowserTab shows a note there
+    // instead), so a browser tab's report places nothing.
+    const owner = ownerOf(e);
+    if (!owner) return;
     browsers.setBounds(id, {
       x: Math.round(b.x), y: Math.round(b.y),
       width: Math.max(0, Math.round(b.width)), height: Math.max(0, Math.round(b.height)),
-    }, ownerOf(e));
+    }, owner);
   });
   ipcMain.handle("hv:browser-visible", (_e, id: string, visible: boolean) => browsers.setVisible(id, visible));
   // origin "user": typing a URL IS consent (§28) — no prompt, still logged.
@@ -4485,6 +4533,22 @@ export function registerIpc(
     sessionBypass.set(id, on); // §39: what the session now runs, so its next "Turn off" is measured against it
     void (manager.get(id) as PiClient | null)?.send({ type: "prompt", message: `/hv-dangerous ${on ? "on" : "off"}` }).catch(() => {});
   };
+  // Appearance › Density: stored, then pushed to every window — one app, one density.
+  ipcMain.handle("hv:set-density", (_e, d: unknown) => {
+    if (!isDensity(d)) return;
+    setDensity(d);
+    send("hv:density-changed", d);
+  });
+  // Appearance › Theme: stored, handed to Electron (menus, dialogs, scrollbars, and the
+  // renderer's prefers-color-scheme follow it), then pushed to every window.
+  ipcMain.handle("hv:set-color-scheme", (_e, s: unknown) => {
+    if (!isColorScheme(s)) return;
+    setColorScheme(s);
+    nativeTheme.themeSource = s;
+    const bg = WINDOW_BACKGROUND[nativeTheme.shouldUseDarkColors ? "dark" : "light"];
+    for (const w of windows.all()) if (!w.isDestroyed() && "setBackgroundColor" in w) w.setBackgroundColor(bg);
+    send("hv:color-scheme-changed", s);
+  });
   // §9 round 28: one global switch. Written to Pi's settings.json for every later spawn, and sent
   // live (Pi persists the same key itself, so the two can't disagree).
   ipcMain.handle("hv:get-auto-compaction", () => getAutoCompaction());
@@ -4516,6 +4580,31 @@ export function registerIpc(
       // §29: a worktree session's workspaceId is the worktree root; its bypass is its project's.
       if (worktrees.projectOf(index.get(id)?.workspaceId ?? "") === workspace) applyBypassLive(id);
     }
+  });
+
+  // §9: Rewind's copy of the files. Captures read it per message; the bridge reads it at
+  // spawn (an edit is a safe default only while it can be undone), so affected sessions
+  // respawn when idle — the same reload pass as the tool switches.
+  // Only the sessions whose resolved value can have changed: a global change skips
+  // workspaces with their own override; a worktree session follows its project (§29).
+  const reloadForFileRewind = (affects: (project: string) => boolean): void => {
+    const seen = new Set<string>();
+    for (const id of manager.activeIds()) {
+      const ws = index.get(id)?.workspaceId;
+      if (!ws || seen.has(ws) || !affects(worktrees.projectOf(ws))) continue;
+      seen.add(ws);
+      scheduleRuntimeReload("fileRewind", "workspace", ws);
+    }
+  };
+  ipcMain.handle("hv:get-global-file-rewind", () => getGlobalFileRewind());
+  ipcMain.handle("hv:set-global-file-rewind", (_e, on: boolean) => {
+    setGlobalFileRewind(!!on);
+    reloadForFileRewind((project) => getWorkspaceFileRewind(project) === null);
+  });
+  ipcMain.handle("hv:get-workspace-file-rewind", (_e, workspace: string) => getWorkspaceFileRewind(workspace));
+  ipcMain.handle("hv:set-workspace-file-rewind", (_e, workspace: string, on: boolean | null) => {
+    setWorkspaceFileRewind(workspace, on === null ? null : !!on);
+    reloadForFileRewind((project) => project === workspace);
   });
 
   // §13 round 6: global on/off for built-in custom tools (plan mode, ask_user).
@@ -5003,7 +5092,8 @@ export function registerIpc(
     if (!inlet || !feedbackCfg) return { ok: false, reason: "unavailable" };
     const win = windows.bySender(e.sender);
     let thumbnail: string | null = null;
-    if (win) {
+    // Web mode: a browser tab cannot be photographed from here — no capture offered.
+    if (win && !(win instanceof WebWindow)) {
       try {
         // BEFORE the dialog paints — the renderer mounts it on this reply, so the
         // picture is the app as the user left it, with no scrim and no dialog.
@@ -5402,7 +5492,7 @@ export function registerIpc(
     ".gif": "image/gif", ".webp": "image/webp",
   };
   ipcMain.handle("hv:pick-image", async (e) => {
-    const r = await dialog.showOpenDialog(ownerOf(e), {
+    const r = await openDialog(e, {
       properties: ["openFile"],
       filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
     });
@@ -5423,7 +5513,7 @@ export function registerIpc(
   // It also means picking and dropping take the SAME second step, rather than
   // one path that converts in the dialog handler and one that does not.
   ipcMain.handle("hv:pick-document", async (e) => {
-    const r = await dialog.showOpenDialog(ownerOf(e), {
+    const r = await openDialog(e, {
       properties: ["openFile", "multiSelections"],
       filters: [{ name: "Documents", extensions: [...DOCUMENT_EXTENSIONS] }],
     });
@@ -6505,7 +6595,7 @@ export function registerIpc(
     scheduleSkillReload("global", null);
   });
   ipcMain.handle("hv:skills-add-linked", async (e) => {
-    const r = await dialog.showOpenDialog(ownerOf(e), { properties: ["openDirectory"], title: "Link a skills directory" });
+    const r = await openDialog(e, { properties: ["openDirectory"], title: "Link a skills directory" });
     if (r.canceled || !r.filePaths[0]) return getLinkedSkillDirs();
     setLinkedSkillDirs([...getLinkedSkillDirs(), r.filePaths[0]]);
     skillsChanged();
@@ -6535,7 +6625,7 @@ export function registerIpc(
   app.on("will-quit", () => { for (const s of importSessions.values()) s.cleanup?.(); });
 
   ipcMain.handle("hv:skills-import-local", async (e) => {
-    const r = await dialog.showOpenDialog(ownerOf(e), { properties: ["openDirectory"], title: "Import a skill folder (or a folder of skills)" });
+    const r = await openDialog(e, { properties: ["openDirectory"], title: "Import a skill folder (or a folder of skills)" });
     if (r.canceled || !r.filePaths[0]) return null;
     const picked = r.filePaths[0];
     const found = scanSkillsDir(picked, "managed");
@@ -6896,7 +6986,7 @@ export function registerIpc(
     // opens the picker. Linked dirs are referenced in place, never copied.
     let picked = typeof dir === "string" && dir.trim() ? dir : null;
     if (!picked) {
-      const r = await dialog.showOpenDialog(ownerOf(e), { properties: ["openDirectory"], title: "Link a prompts directory" });
+      const r = await openDialog(e, { properties: ["openDirectory"], title: "Link a prompts directory" });
       if (r.canceled || !r.filePaths[0]) return getLinkedPromptTemplateDirs();
       picked = r.filePaths[0];
     }
@@ -6943,7 +7033,7 @@ export function registerIpc(
   app.on("will-quit", () => { for (const s of promptTemplateImports.values()) s.cleanup?.(); });
 
   ipcMain.handle("hv:prompt-templates-import-local", async (e) => {
-    const r = await dialog.showOpenDialog(ownerOf(e), { properties: ["openDirectory"], title: "Import prompts from a folder" });
+    const r = await openDialog(e, { properties: ["openDirectory"], title: "Import prompts from a folder" });
     if (r.canceled || !r.filePaths[0]) return null;
     const found = scanImportRoot(r.filePaths[0]);
     if (found.length === 0) return { token: null, templates: [], error: "No .md prompts found in that folder." };
